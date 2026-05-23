@@ -1,0 +1,15 @@
+epoch,split,class_name,class_index,positive_count,negative_count,auroc,valid_for_auroc
+20,val,Atelectasis,0,21,139,0.5981500513874614,True
+20,val,Cardiomegaly,1,4,156,0.6410256410256411,True
+20,val,Consolidation,2,6,154,0.5541125541125541,True
+20,val,Edema,3,0,160,,False
+20,val,Effusion,4,22,138,0.7312252964426877,True
+20,val,Emphysema,5,6,154,0.42099567099567103,True
+20,val,Fibrosis,6,6,154,0.6590909090909092,True
+20,val,Hernia,7,0,160,,False
+20,val,Infiltration,8,26,134,0.5815154994259472,True
+20,val,Mass,9,7,153,0.5546218487394958,True
+20,val,Nodule,10,15,145,0.6758620689655173,True
+20,val,Pleural_Thickening,11,0,160,,False
+20,val,Pneumonia,12,0,160,,False
+20,val,Pneumothorax,13,1,159,0.6603773584905661,True

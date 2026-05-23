@@ -25,4 +25,5 @@ augmentation:
   eval:
     resize: 256
 output_dir: models/runs
+pretrained: false
 run_dir: C:\Users\profb\PROJECTS\cxr-disease-classification\models\runs\densenet121_seed42_fold0

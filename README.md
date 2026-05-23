@@ -1,6 +1,6 @@
 ## Install Dependencies
 `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132`
-`pip install dotenv pandas matplotlib pyyaml`
+`pip install dotenv pandas matplotlib pyyaml scikit-learn tqdm`
 
 Plan
     five architectures
