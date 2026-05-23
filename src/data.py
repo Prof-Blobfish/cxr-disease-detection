@@ -24,7 +24,7 @@ class DataBundle:
 def prepare_data(
         root: str | Path | None = None,
         val_fraction: float = VAL_SPLIT,
-        seed: int = RANDOM_SEED,
+        split_seed: int = RANDOM_SEED,
 ) -> DataBundle:
     if not 0 < val_fraction < 1:
         raise ValueError("val_fraction must be between 0 and 1")
@@ -48,7 +48,7 @@ def prepare_data(
         metadata_df,
         dataset_root,
         val_fraction,
-        seed,
+        split_seed,
     )
 
     train_df = train_df.assign(split="train")
@@ -244,7 +244,7 @@ def _apply_splits(
         df: pd.DataFrame,
         root: Path,
         val_fraction: float,
-        seed: int,
+        split_seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     train_val_path = root / "train_val_list.txt"
     test_path = root / "test_list.txt"
@@ -270,7 +270,7 @@ def _apply_splits(
     patient_ids = train_val_df["patient_id"].dropna().astype(int).unique()
     patient_ids = np.array(sorted(patient_ids))
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(split_seed)
     rng.shuffle(patient_ids)
 
     val_count = max(1, int(round(len(patient_ids) * val_fraction)))

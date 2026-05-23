@@ -12,16 +12,20 @@ import json
 
 import math
 import pandas as pd
+import numpy as np
+import random
 
 import torch
 from torch.utils.data import DataLoader
 
-from config import PROJECT_ROOT
+from config import PROJECT_ROOT, NUM_WORKERS
 from data import prepare_data
-from datasets import CXRDataset, build_datasets
+from datasets import build_datasets
 from transforms import build_transforms
 from models.factory import build_model, build_parameter_groups
 from metrics import compute_multilabel_metrics, per_class_metrics_to_frame
+
+# ====================== Config & Setup ======================
 
 def load_run_config(config_path: str | Path) -> dict:
     config_path = Path(config_path)
@@ -41,14 +45,12 @@ def clear_run_artifacts(run_dir: Path) -> None:
         "config.yaml",
         "class_order.json",
         "history.csv",
-        "metrics_val.json",
+        "best_val_metrics.json",
         "metrics_test.json",
-        "per_class_metrics_val.csv",
+        "best_val_per_class_metrics.csv",
         "per_class_metrics_test.csv",
-        "val_predictions.csv",
+        "best_val_predictions.csv",
         "test_predictions.csv",
-        "predictions_val.csv",
-        "predictions_test.csv",
     ]
 
     for filename in owned_files:
@@ -91,6 +93,40 @@ def initialize_run_dir(
 
     return run_dir
 
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
+
+def seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+def make_loader_generator(seed: int) -> torch.Generator:
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
+
+# ====================== Builders ======================
+
 def build_criterion(
         cfg: dict,
         pos_weights,
@@ -118,6 +154,28 @@ def build_optimizer(
         return torch.optim.AdamW(param_groups)
     
     raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+def build_scheduler(
+        cfg: dict,
+        optimizer: torch.optim.Optimizer,
+):
+    scheduler_type = str(cfg.get("scheduler_type", "none")).lower()
+    scheduler_cfg = cfg.get("scheduler", {}) or {}
+
+    if scheduler_type in {"none", ""}:
+        return None
+    
+    if scheduler_type == "cosine":
+        eta_min = float(scheduler_cfg.get("eta_min", 0.0))
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(cfg["num_epochs"]),
+            eta_min=eta_min,
+        )
+    
+    raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+# ====================== Training ======================
 
 def train_one_epoch(
         model: torch.nn.Module,
@@ -179,9 +237,9 @@ def train_one_epoch(
         "num_examples": float(num_examples),
     }
 
-def validate_one_epoch(
+def evaluate_one_epoch(
         model: torch.nn.Module,
-        val_loader: DataLoader,
+        eval_loader: DataLoader,
         criterion: torch.nn.Module,
         device: torch.device,
         max_batches: int | None = None,
@@ -197,12 +255,12 @@ def validate_one_epoch(
     all_targets: list[torch.Tensor] = []
     all_image_ids: list[str] = []
 
-    total_batches = len(val_loader)
+    total_batches = len(eval_loader)
     if max_batches is not None:
         total_batches = min(total_batches, max_batches)
 
     progress_bar = tqdm(
-        val_loader,
+        eval_loader,
         total=total_batches,
         desc=progress_desc,
         leave=False,
@@ -218,7 +276,7 @@ def validate_one_epoch(
 
             if not torch.isfinite(loss):
                 raise ValueError(
-                    f"Non-finite validation loss at batch {batch_idx}: {loss.item()}"
+                    f"Non-finite loss at batch {batch_idx}: {loss.item()}"
                 )
             
             batch_size = images.size(0)
@@ -227,7 +285,7 @@ def validate_one_epoch(
             num_batches += 1
 
             avg_loss = running_loss / max(num_examples, 1)
-            progress_bar.set_postfix({"val_loss": f"{avg_loss:.4f}"})
+            progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
             all_logits.append(logits.detach().cpu())
             all_targets.append(targets.detach().cpu())
@@ -236,10 +294,10 @@ def validate_one_epoch(
             if max_batches is not None and num_batches >= max_batches:
                 break
 
-    val_loss = running_loss / max(num_examples, 1)
+    loss = running_loss / max(num_examples, 1)
 
     return {
-        "val_loss": val_loss,
+        "loss": loss,
         "num_batches": float(num_batches),
         "num_examples": float(num_examples),
         "logits": torch.cat(all_logits, dim=0),
@@ -247,17 +305,20 @@ def validate_one_epoch(
         "image_ids": all_image_ids,
     }
 
+# ====================== Artifacts & Logging ======================
+
 def make_history_row(
         epoch: int,
         train_metrics: dict[str, float],
-        val_metrics: dict[str, float],
+        split_metrics: dict[str, object],
         metric_summary: dict[str, float],
 ) -> dict[str, float | int]:
     return {
         "epoch": epoch,
-        "train_loss": train_metrics["train_loss"],
-        "val_loss": val_metrics["val_loss"],
-        "val_macro_auroc": metric_summary["macro_auroc"],
+        "train_loss": float(train_metrics["train_loss"]),
+        "val_loss": float(split_metrics["loss"]),
+        "val_macro_auroc": float(metric_summary["macro_auroc"]),
+        "val_macro_auprc": float(metric_summary["macro_auprc"]),
     }
 
 def save_history_csv(
@@ -272,6 +333,7 @@ def save_history_csv(
         "train_loss",
         "val_loss",
         "val_macro_auroc",
+        "val_macro_auprc",
     ]
 
     with history_path.open("w", encoding="utf-8", newline="") as handle:
@@ -285,6 +347,7 @@ def save_history_csv(
                     "train_loss": float(row["train_loss"]),
                     "val_loss": float(row["val_loss"]),
                     "val_macro_auroc": float(row["val_macro_auroc"]),
+                    "val_macro_auprc": float(row["val_macro_auprc"]),
                 }
             )
     
@@ -300,24 +363,29 @@ def _json_safe_float(value: object) -> float | None:
     
     return numeric_value
 
-def save_metrics_val_json(
+def save_metrics_json(
         epoch: int,
-        val_metrics: dict[str, object],
+        split: str,
+        split_metrics: dict[str, object],
         metric_summary: dict[str, object],
         run_dir: str | Path,
+        output_filename: str | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
-    metrics_path = run_dir / "metrics_val.json"
+    metrics_filename = output_filename or f"metrics_{split}.json"
+    metrics_path = run_dir / metrics_filename
 
     payload = {
         "epoch": int(epoch),
-        "split": "val",
-        "val_loss": _json_safe_float(val_metrics["val_loss"]),
-        "val_macro_auroc": _json_safe_float(metric_summary["macro_auroc"]),
+        "split": split,
+        f"{split}_loss": _json_safe_float(split_metrics["loss"]),
+        f"{split}_macro_auroc": _json_safe_float(metric_summary["macro_auroc"]),
+        f"{split}_macro_auprc": _json_safe_float(metric_summary["macro_auprc"]),
         "num_valid_auroc_classes": int(metric_summary["num_valid_auroc_classes"]),
+        "num_valid_auprc_classes": int(metric_summary["num_valid_auprc_classes"]),
         "num_total_classes": int(metric_summary["num_total_classes"]),
-        "num_batches": int(val_metrics["num_batches"]),
-        "num_examples": int(val_metrics["num_examples"]),
+        "num_batches": int(split_metrics["num_batches"]),
+        "num_examples": int(split_metrics["num_examples"]),
     }
 
     with metrics_path.open("w", encoding="utf-8") as handle:
@@ -326,20 +394,23 @@ def save_metrics_val_json(
 
     return metrics_path
 
-def save_per_class_metrics_val_csv(
+def save_per_class_metrics_csv(
         epoch: int,
+        split: str,
         metric_summary: dict[str, object],
         run_dir: str | Path,
+        output_filename: str | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
-    per_class_path = run_dir / "per_class_metrics_val.csv"
+    per_class_filename = output_filename or f"per_class_metrics_{split}.csv"
+    per_class_path = run_dir / per_class_filename
 
     per_class_df = per_class_metrics_to_frame(metric_summary).copy()
 
     if per_class_df.empty:
         raise ValueError("No per-class metrics available to save.")
-    
-    per_class_df.insert(0, "split", "val")
+
+    per_class_df.insert(0, "split", split)
     per_class_df.insert(0, "epoch", int(epoch))
 
     column_order = [
@@ -349,8 +420,11 @@ def save_per_class_metrics_val_csv(
         "class_index",
         "positive_count",
         "negative_count",
+        "positive_prevalence",
         "auroc",
+        "auprc",
         "valid_for_auroc",
+        "valid_for_auprc",
     ]
     per_class_df = per_class_df.loc[:, column_order]
 
@@ -364,9 +438,11 @@ def save_predictions_csv(
         split_metrics: dict[str, object],
         target_columns: list[str],
         run_dir: str | Path,
+        output_filename: str | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
-    predictions_path = run_dir / f"{split}_predictions.csv"
+    predictions_filename = output_filename or f"{split}_predictions.csv"
+    predictions_path = run_dir / predictions_filename
 
     image_ids = list(split_metrics["image_ids"])
     logits = split_metrics["logits"]
@@ -461,7 +537,7 @@ def save_class_order_json(
 
 def resolve_checkpoint_metric(
         cfg: dict,
-        val_metrics: dict[str, object],
+        split_metrics: dict[str, object],
         metric_summary: dict[str, object],
 ) -> float:
     metric_name = str(cfg["checkpoint_metric"]["name"]).lower()
@@ -469,16 +545,16 @@ def resolve_checkpoint_metric(
     if metric_name == "val_macro_auroc":
         metric_value = metric_summary["macro_auroc"]
     elif metric_name == "val_loss":
-        metric_value = val_metrics["val_loss"]
+        metric_value = split_metrics["loss"]
     else:
         raise ValueError(f"Unsupported checkpoint metric: {metric_name}")
-    
+
     metric_value = float(metric_value)
     if not math.isfinite(metric_value):
         raise ValueError(
             f"Checkpoint metric '{metric_name}' value is not finite: {metric_value}"
         )
-    
+
     return metric_value
 
 def is_better_checkpoint(
@@ -507,6 +583,7 @@ def save_checkpoint(
         current_metric: float,
         best_metric: float | None,
         cfg: dict,
+        scheduler=None,
 ) -> Path:
     checkpoint_path = Path(checkpoint_path)
 
@@ -520,10 +597,13 @@ def save_checkpoint(
         "checkpoint_metric_mode": str(cfg["checkpoint_metric"]["mode"]).lower(),
     }
 
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+
     torch.save(payload, checkpoint_path)
     return checkpoint_path
 
-def persist_epoch_artifacts(
+def persist_epoch_state(
         *,
         epoch: int,
         run_dir: str | Path,
@@ -531,20 +611,13 @@ def persist_epoch_artifacts(
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         cfg: dict,
-        val_metrics: dict[str, object],
-        metric_summary: dict[str, object],
         current_metric: float,
         best_metric: float | None,
-        improved: bool,
-        target_columns: list[str],
+        scheduler=None,
 ) -> dict[str, Path]:
     run_dir = Path(run_dir)
 
-    written_paths: dict[str, Path] = {}
-
     history_path = save_history_csv(history, run_dir)
-    written_paths["history"] = history_path
-
     last_checkpoint_path = save_checkpoint(
         checkpoint_path=run_dir / "checkpoints" / "last.pt",
         epoch=epoch,
@@ -553,80 +626,111 @@ def persist_epoch_artifacts(
         current_metric=current_metric,
         best_metric=best_metric,
         cfg=cfg,
+        scheduler=scheduler,
     )
-    written_paths["last_checkpoint"] = last_checkpoint_path
 
-    if improved:
-        best_checkpoint_path = save_checkpoint(
-            checkpoint_path=run_dir / "checkpoints" / "best.pt",
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            current_metric=current_metric,
-            best_metric=best_metric,
-            cfg=cfg,
-        )
-        written_paths["best_checkpoint"] = best_checkpoint_path
+    return {
+        "history": history_path,
+        "last_checkpoint": last_checkpoint_path,
+    }
 
-        metrics_val_path = save_metrics_val_json(
-            epoch=epoch,
-            val_metrics=val_metrics,
-            metric_summary=metric_summary,
-            run_dir=run_dir,
-        )
-        written_paths["metrics_val"] = metrics_val_path
+def persist_best_validation_artifacts(
+        *,
+        epoch: int,
+        run_dir: str | Path,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        cfg: dict,
+        split_metrics: dict[str, object],
+        metric_summary: dict[str, object],
+        current_metric: float,
+        best_metric: float | None,
+        target_columns: list[str],
+        scheduler=None,
+) -> dict[str, Path]:
+    run_dir = Path(run_dir)
 
-        per_class_metrics_path = save_per_class_metrics_val_csv(
-            epoch=epoch,
-            metric_summary=metric_summary,
-            run_dir=run_dir,
-        )
-        written_paths["per_class_metrics_val"] = per_class_metrics_path
+    best_checkpoint_path = save_checkpoint(
+        checkpoint_path=run_dir / "checkpoints" / "best.pt",
+        epoch=epoch,
+        model=model,
+        optimizer=optimizer,
+        current_metric=current_metric,
+        best_metric=best_metric,
+        cfg=cfg,
+        scheduler=scheduler,
+    )
 
-        val_predictions_path = save_predictions_csv(
-            epoch=epoch,
-            split="val",
-            split_metrics=val_metrics,
-            target_columns=target_columns,
-            run_dir=run_dir,
-        )
-        written_paths["val_predictions"] = val_predictions_path
+    best_val_metrics_path = save_metrics_json(
+        epoch=epoch,
+        split="val",
+        split_metrics=split_metrics,
+        metric_summary=metric_summary,
+        run_dir=run_dir,
+        output_filename="best_val_metrics.json",
+    )
 
-    return written_paths
+    best_val_per_class_metrics_path = save_per_class_metrics_csv(
+        epoch=epoch,
+        split="val",
+        metric_summary=metric_summary,
+        run_dir=run_dir,
+        output_filename="best_val_per_class_metrics.csv",
+    )
 
+    best_val_predictions_path = save_predictions_csv(
+        epoch=epoch,
+        split="val",
+        split_metrics=split_metrics,
+        target_columns=target_columns,
+        run_dir=run_dir,
+        output_filename="best_val_predictions.csv",
+    )
+
+    return {
+        "best_checkpoint": best_checkpoint_path,
+        "best_val_metrics": best_val_metrics_path,
+        "best_val_per_class_metrics": best_val_per_class_metrics_path,
+        "best_val_predictions": best_val_predictions_path,
+    }
+    
 def print_epoch_summary(
         *,
         epoch: int,
         num_epochs: int,
         cfg: dict,
         train_metrics: dict[str, float],
-        val_metrics: dict[str, float],
+        split_metrics: dict[str, object],
         metric_summary: dict[str, float],
         current_metric: float,
         best_epoch: int,
-        artifact_paths: dict[str, Path],
-        improved: bool,
+        epoch_artifacts: dict[str, Path],
+        best_artifacts: dict[str, Path] | None,
 ) -> None:
     print(f"=== Epoch {epoch} / {num_epochs} Summary ===")
     print(f"Train loss: {train_metrics['train_loss']:.6f}")
-    print(f"Val loss: {float(val_metrics['val_loss']):.6f}")
+    print(f"Val loss: {float(split_metrics['loss']):.6f}")
     print(f"Val macro AUROC: {float(metric_summary['macro_auroc']):.6f}")
+    print(f"Val macro AUPRC: {float(metric_summary['macro_auprc']):.6f}")
     print(
         f"Checkpoint metric ({cfg['checkpoint_metric']['name']}): "
         f"{current_metric:.6f}"
     )
     print(f"Best epoch so far: {best_epoch}")
-    print(f"Saved history to: {artifact_paths['history']}")
-    print(f"Saved last checkpoint to: {artifact_paths['last_checkpoint']}")
+    print(f"Saved history to: {epoch_artifacts['history']}")
+    print(f"Saved last checkpoint to: {epoch_artifacts['last_checkpoint']}")
 
-    if improved:
-        print(f"Updated best checkpoint: {artifact_paths['best_checkpoint']}")
-        print(f"Saved validation metrics to: {artifact_paths['metrics_val']}")
+    if best_artifacts is not None:
+        print(f"Updated best checkpoint: {best_artifacts['best_checkpoint']}")
+        print(f"Saved best validation metrics to: {best_artifacts['best_val_metrics']}")
         print(
-            f"Saved per-class validation metrics to: "
-            f"{artifact_paths['per_class_metrics_val']}"
+            f"Saved best per-class validation metrics to: "
+            f"{best_artifacts['best_val_per_class_metrics']}"
         )
-        print(f"Saved validation predictions to: {artifact_paths['val_predictions']}")
+        print(
+            f"Saved best validation predictions to: "
+            f"{best_artifacts['best_val_predictions']}"
+        )
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -640,15 +744,27 @@ def main() -> None:
 
     cfg = load_run_config(args.config)
 
-    print("=== Run Config ===")
+    train_seed = int(cfg["train_seed"])
+    split_seed = int(cfg["split_seed"])
+    deterministic = bool(cfg["deterministic"])
+    
+    train_aug_cfg = cfg.get("augmentation", {}).get("train", {}) or {}
+    rotation_deg = float(train_aug_cfg.get("rotation_deg", 0.0))
+
+    set_global_seed(train_seed, deterministic=deterministic)
+    bundle = prepare_data(split_seed=split_seed)
+
+    print("\n=== Run Config ===")
     print(f"Run: {cfg['run_name']}")
     print(f"Model: {cfg['model_name']}")
     print(f"Backbone LR: {cfg['optimizer']['backbone_lr']}")
-    print(f"Rotation Degree: {cfg['augmentation']['train']['rotation_deg']}")
+    print(f"Rotation Degree: {rotation_deg}")
+    print(f"Train seed: {train_seed}")
+    print(f"Split seed: {split_seed}")
+    print(f"Deterministic: {deterministic}")
 
-    bundle = prepare_data(seed=cfg["seed"])
 
-    print("=== Data Summary ===")
+    print("\n=== Data Summary ===")
     print(f"Train rows: {len(bundle.train_df)}")
     print(f"Val rows: {len(bundle.val_df)}")
     print(f"Test rows: {len(bundle.test_df)}")
@@ -669,17 +785,44 @@ def main() -> None:
 
     transform_dict = build_transforms(cfg)
 
-    #DataLoader Smoke Test
     datasets = build_datasets(
         bundle,
         train_transform=transform_dict["train"],
         eval_transform=transform_dict["eval"],
     )
-    
-    train_loader = DataLoader(datasets["train"], batch_size=cfg['batch_size'], shuffle=True)
-    val_loader = DataLoader(datasets["val"], batch_size=cfg['batch_size'], shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    use_cuda = device.type == "cuda"
+    
+    loader_common = {
+        "batch_size": cfg["batch_size"],
+        "num_workers": NUM_WORKERS,
+        "pin_memory": use_cuda,
+        "persistent_workers": NUM_WORKERS > 0,
+    }
+    if NUM_WORKERS > 0:
+        loader_common["prefetch_factor"] = 2
+
+    train_generator = make_loader_generator(train_seed)
+
+    train_loader = DataLoader(
+        datasets["train"], 
+        shuffle=True,
+        worker_init_fn=seed_worker,
+        generator=train_generator,
+        **loader_common,
+    )
+    val_loader = DataLoader(
+        datasets["val"], 
+        shuffle=False,
+        **loader_common,
+    )
+    test_loader = DataLoader(
+        datasets["test"], 
+        shuffle=False,
+        **loader_common,
+    )
 
     model = build_model(cfg, num_classes=len(bundle.class_names)).to(device)
     param_groups = build_parameter_groups(model, cfg)
@@ -692,6 +835,10 @@ def main() -> None:
     optimizer = build_optimizer(
         cfg=cfg,
         param_groups=param_groups,
+    )
+    scheduler = build_scheduler(
+        cfg=cfg,
+        optimizer=optimizer,
     )
 
     history: list[dict[str, float | int]] = []
@@ -719,9 +866,9 @@ def main() -> None:
             progress_desc=f"Train {epoch}/{num_epochs}",
         )
 
-        val_metrics = validate_one_epoch(
+        val_metrics = evaluate_one_epoch(
             model=model,
-            val_loader=val_loader,
+            eval_loader=val_loader,
             criterion=criterion,
             device=device,
             max_batches=val_max_batches,
@@ -737,14 +884,14 @@ def main() -> None:
         history_row = make_history_row(
             epoch=epoch,
             train_metrics=train_metrics,
-            val_metrics=val_metrics,
+            split_metrics=val_metrics,
             metric_summary=metric_summary,
         )
         history.append(history_row)
 
         current_metric = resolve_checkpoint_metric(
             cfg=cfg,
-            val_metrics=val_metrics,
+            split_metrics=val_metrics,
             metric_summary=metric_summary,
         )
 
@@ -761,33 +908,49 @@ def main() -> None:
         else:
             epochs_without_improvement += 1
 
-        artifact_paths = persist_epoch_artifacts(
+        epoch_artifacts = persist_epoch_state(
             epoch=epoch,
             run_dir=run_dir,
             history=history,
             model=model,
             optimizer=optimizer,
             cfg=cfg,
-            val_metrics=val_metrics,
-            metric_summary=metric_summary,
             current_metric=current_metric,
             best_metric=best_metric,
-            improved=improved,
-            target_columns=bundle.target_columns,
+            scheduler=scheduler,
         )
+
+        best_artifacts = None
+        if improved:
+            best_artifacts = persist_best_validation_artifacts(
+                epoch=epoch,
+                run_dir=run_dir,
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                split_metrics=val_metrics,
+                metric_summary=metric_summary,
+                current_metric=current_metric,
+                best_metric=best_metric,
+                target_columns=bundle.target_columns,
+                scheduler=scheduler,
+            )
 
         print_epoch_summary(
             epoch=epoch,
             num_epochs=num_epochs,
             cfg=cfg,
             train_metrics=train_metrics,
-            val_metrics=val_metrics,
+            split_metrics=val_metrics,
             metric_summary=metric_summary,
             current_metric=current_metric,
             best_epoch=best_epoch,
-            artifact_paths=artifact_paths,
-            improved=improved,
+            epoch_artifacts=epoch_artifacts,
+            best_artifacts=best_artifacts,
         )
+
+        current_lrs = [group["lr"] for group in optimizer.param_groups]
+        print(f"Current LRs: {current_lrs}")
 
         if epochs_without_improvement >= patience:
             print(
@@ -795,6 +958,65 @@ def main() -> None:
                 f"{epochs_without_improvement} epochs without improvement."
             )
             break
+
+        if scheduler is not None:
+            scheduler.step()
+
+    # Training metrics
+
+    best_checkpoint_path = run_dir / "checkpoints" / "best.pt"
+    best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+
+    print(f"Loaded best checkpoint from: {best_checkpoint_path}")
+    print(f"Evaluting best checkpoint from epoch: {best_checkpoint['epoch']}")
+
+    test_metrics = evaluate_one_epoch(
+        model=model,
+        eval_loader=test_loader,
+        criterion=criterion,
+        device=device,
+        max_batches=None,
+        progress_desc="Test",
+    )
+
+    test_metric_summary = compute_multilabel_metrics(
+        logits=test_metrics["logits"],
+        targets=test_metrics["targets"],
+        class_names=bundle.class_names,
+    )
+
+    metrics_test_path = save_metrics_json(
+        epoch=best_checkpoint["epoch"],
+        split="test",
+        split_metrics=test_metrics,
+        metric_summary=test_metric_summary,
+        run_dir=run_dir,
+    )
+
+    per_class_metrics_test_path = save_per_class_metrics_csv(
+        epoch=int(best_checkpoint["epoch"]),
+        split="test",
+        metric_summary=test_metric_summary,
+        run_dir=run_dir,
+    )
+
+    test_predictions_path = save_predictions_csv(
+        epoch=int(best_checkpoint["epoch"]),
+        split="test",
+        split_metrics=test_metrics,
+        target_columns=bundle.target_columns,
+        run_dir=run_dir,
+    )
+
+    print("=== Test Summary ===")
+    print(f"Test loss: {float(test_metrics['loss']):.6f}")
+    print(f"Test macro AUROC: {float(test_metric_summary['macro_auroc']):.6f}")
+    print(f"Test macro AUPRC: {float(test_metric_summary['macro_auprc']):.6f}")
+    print(f"Saved test metrics to: {metrics_test_path}")
+    print(f"Saved per-class test metrics to: {per_class_metrics_test_path}")
+    print(f"Saved test predictions to: {test_predictions_path}")
 
     print("=== Training Complete ===")
     print(f"Best epoch: {best_epoch}")

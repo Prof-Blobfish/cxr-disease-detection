@@ -37,7 +37,8 @@ class CXRDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.df.iloc[idx]
 
-        image = Image.open(row["image_path"]).convert("RGB")
+        with Image.open(row["image_path"]) as image_file:
+            image = image_file.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
         else:

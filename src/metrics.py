@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 
 def _to_numpy(value: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -37,6 +37,7 @@ def compute_multilabel_metrics(
 
     per_class_rows: list[dict[str, Any]] = []
     valid_aurocs: list[float] = []
+    valid_auprcs: list[float] = []
 
     for class_idx, class_name in enumerate(class_names):
         y_true = targets_np[:, class_idx]
@@ -44,14 +45,21 @@ def compute_multilabel_metrics(
 
         positive_count = int(y_true.sum())
         negative_count = int(len(y_true)) - positive_count
+        positive_prevalence = float(positive_count / len(y_true))
 
-        if positive_count == 0 or negative_count == 0:
-            auroc = None
-            valid_for_auroc = False
-        else:
+        valid_for_auroc = positive_count > 0 and negative_count > 0
+        if valid_for_auroc:
             auroc = float(roc_auc_score(y_true, y_score))
             valid_aurocs.append(auroc)
-            valid_for_auroc = True
+        else:
+            auroc = None
+
+        valid_for_auprc = positive_count > 0
+        if valid_for_auprc:
+            auprc = float(average_precision_score(y_true, y_score))
+            valid_auprcs.append(auprc)
+        else:
+            auprc = None
 
         per_class_rows.append(
             {
@@ -59,16 +67,22 @@ def compute_multilabel_metrics(
                 "class_index": class_idx,
                 "positive_count": positive_count,
                 "negative_count": negative_count,
+                "positive_prevalence": positive_prevalence,
                 "auroc": auroc,
+                "auprc": auprc,
                 "valid_for_auroc": valid_for_auroc,
+                "valid_for_auprc": valid_for_auprc,
             }
         )
 
     macro_auroc = float(np.mean(valid_aurocs)) if valid_aurocs else float("nan")
+    macro_auprc = float(np.mean(valid_auprcs)) if valid_auprcs else float("nan")
 
     return {
         "macro_auroc": macro_auroc,
+        "macro_auprc": macro_auprc,
         "num_valid_auroc_classes": len(valid_aurocs),
+        "num_valid_auprc_classes": len(valid_auprcs),
         "num_total_classes": len(class_names),
         "per_class": per_class_rows,
     }
