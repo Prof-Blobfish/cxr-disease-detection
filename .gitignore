@@ -1,6 +1,6 @@
 # Experiments and output files
 experiments/
-models/
+outputs/
 
 # Python virtual environments
 .venv/

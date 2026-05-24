@@ -15,9 +15,6 @@ if not dataset_path:
     raise RuntimeError("DATASET_PATH not found in .env")
 
 DATASET_ROOT = Path(dataset_path).expanduser().resolve()
-MODEL_DIR = PROJECT_ROOT / "models"
-
-
 
 IMAGE_SIZE = 256
 BATCH_SIZE = 32

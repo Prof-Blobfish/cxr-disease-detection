@@ -6,6 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 from sklearn.metrics import average_precision_score, precision_recall_curve
 
 
@@ -314,13 +315,188 @@ def save_val_pr_curves_plot(
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
+def build_threshold_delta_frame(
+    default_df: pd.DataFrame,
+    tuned_df: pd.DataFrame,
+) -> pd.DataFrame:
+    metric_columns = ["f1", "recall", "specificity"]
+
+    default_df = coerce_numeric_columns(
+        default_df,
+        ["class_index", *metric_columns],
+    ).copy()
+    tuned_df = coerce_numeric_columns(
+        tuned_df,
+        ["class_index", *metric_columns],
+    ).copy()
+
+    merged = default_df.merge(
+        tuned_df,
+        on=["class_name", "class_index"],
+        how="inner",
+        suffixes=("_default", "_tuned"),
+    )
+
+    if merged.empty:
+        raise ValueError("No overlapping classes found between default and tuned threshold metrics.")
+
+    for metric_name in metric_columns:
+        merged[f"delta_{metric_name}"] = (
+            merged[f"{metric_name}_tuned"] - merged[f"{metric_name}_default"]
+        )
+
+    delta_columns = [f"delta_{metric_name}" for metric_name in metric_columns]
+    merged[delta_columns] = merged[delta_columns].fillna(0.0)
+
+    return merged.sort_values("delta_f1", ascending=False)
+
+
+def save_threshold_macro_comparison_plot(
+    default_metrics: dict,
+    tuned_metrics: dict,
+    split: str,
+    output_path: Path,
+) -> None:
+    metric_columns = ["macro_f1", "macro_recall", "macro_specificity"]
+    metric_labels = ["F1", "Recall", "Specificity"]
+
+    default_values = [float(default_metrics[column]) for column in metric_columns]
+    tuned_values = [float(tuned_metrics[column]) for column in metric_columns]
+
+    x = np.arange(len(metric_labels))
+    width = 0.34
+
+    fig, axis = plt.subplots(figsize=(9, 5.5))
+
+    default_bars = axis.bar(
+        x - width / 2,
+        default_values,
+        width=width,
+        label="Default 0.5",
+        color="#8d99ae",
+    )
+    tuned_bars = axis.bar(
+        x + width / 2,
+        tuned_values,
+        width=width,
+        label="Tuned",
+        color="#2a6f97",
+    )
+
+    for bars in (default_bars, tuned_bars):
+        for bar in bars:
+            value = float(bar.get_height())
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + 0.02,
+                f"{value:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    axis.set_xticks(x)
+    axis.set_xticklabels(metric_labels)
+    axis.set_ylim(0.0, 1.05)
+    axis.set_ylabel("Score")
+    axis.set_title(f"Default 0.5 vs Tuned Threshold Metrics ({split.title()})")
+    axis.grid(True, axis="y", alpha=0.25)
+    axis.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_threshold_delta_heatmap(
+    default_df: pd.DataFrame,
+    tuned_df: pd.DataFrame,
+    split: str,
+    output_path: Path,
+) -> None:
+    delta_df = build_threshold_delta_frame(default_df, tuned_df)
+
+    value_columns = ["delta_f1", "delta_recall", "delta_specificity"]
+    metric_labels = ["F1", "Recall", "Specificity"]
+    heatmap_values = delta_df[value_columns].to_numpy(dtype=float)
+
+    figure_height = max(6, 0.45 * len(delta_df))
+    fig, axis = plt.subplots(figsize=(8, figure_height))
+
+    max_abs = float(np.nanmax(np.abs(heatmap_values))) if heatmap_values.size else 1.0
+    max_abs = max(max_abs, 1e-6)
+
+    image = axis.imshow(
+        heatmap_values,
+        aspect="auto",
+        cmap="RdBu_r",
+        vmin=-max_abs,
+        vmax=max_abs,
+    )
+
+    axis.set_xticks(np.arange(len(metric_labels)))
+    axis.set_xticklabels(metric_labels)
+    axis.set_yticks(np.arange(len(delta_df)))
+    axis.set_yticklabels(delta_df["class_name"].astype(str).tolist())
+    axis.set_title(f"Tuned - Default 0.5 Metric Delta ({split.title()})")
+
+    for row_idx in range(heatmap_values.shape[0]):
+        for col_idx in range(heatmap_values.shape[1]):
+            value = float(heatmap_values[row_idx, col_idx])
+            axis.text(
+                col_idx,
+                row_idx,
+                f"{value:+.03f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+
+    colorbar = fig.colorbar(image, ax=axis)
+    colorbar.set_label("Metric delta")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def select_split_rows(df: pd.DataFrame, split: str) -> pd.DataFrame:
+    if "split" not in df.columns:
+        raise KeyError("Expected a 'split' column in merged per-class metrics.")
+
+    filtered_df = df[df["split"].astype(str) == split].copy()
+    if filtered_df.empty:
+        raise ValueError(f"No rows found for split '{split}'.")
+
+    return filtered_df
+
+
+def select_threshold_rows(
+    df: pd.DataFrame,
+    *,
+    split: str,
+    threshold_scheme: str,
+) -> pd.DataFrame:
+    if "threshold_scheme" not in df.columns:
+        raise KeyError("Expected a 'threshold_scheme' column in per_class_threshold_metrics.csv.")
+
+    filtered_df = select_split_rows(df, split)
+    filtered_df = filtered_df[
+        filtered_df["threshold_scheme"].astype(str) == threshold_scheme
+    ].copy()
+
+    if filtered_df.empty:
+        raise ValueError(
+            f"No rows found for split '{split}' and threshold_scheme '{threshold_scheme}'."
+        )
+
+    return filtered_df
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--run-dir",
         required=True,
-        help="Path to a single training run directory under models/runs.",
+        help="Path to a single training run directory under outputs/runs.",
     )
     parser.add_argument(
         "--pr-classes",
@@ -350,13 +526,17 @@ def main() -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     history_df = load_csv(run_dir / "history.csv")
-    best_val_metrics = load_json(run_dir / "best_val_metrics.json")
-    val_per_class_df = load_csv(run_dir / "best_val_per_class_metrics.csv")
-    test_per_class_df = load_csv(run_dir / "per_class_metrics_test.csv")
+    run_summary = load_json(run_dir / "run_summary.json")
+    per_class_ranking_df = load_csv(run_dir / "per_class_ranking_metrics.csv")
+    val_per_class_df = select_split_rows(per_class_ranking_df, "val")
+    test_per_class_df = select_split_rows(per_class_ranking_df, "test")
     val_predictions_df = load_csv(run_dir / "best_val_predictions.csv")
     class_order_payload = load_json(run_dir / "class_order.json")
 
-    best_epoch = int(best_val_metrics["epoch"])
+    threshold_summary = run_summary.get("threshold_metrics")
+    threshold_per_class_path = run_dir / "per_class_threshold_metrics.csv"
+
+    best_epoch = int(run_summary["best_epoch"])
     class_map = build_class_map(class_order_payload)
     selected_classes = select_pr_classes(
         val_per_class_df=val_per_class_df,
@@ -404,6 +584,75 @@ def main() -> None:
         selected_classes=selected_classes,
         output_path=output_paths["pr_curves_val"],
     )
+
+    threshold_comparison_ready = (
+        isinstance(threshold_summary, dict)
+        and threshold_per_class_path.is_file()
+    )
+
+    if threshold_comparison_ready:
+        threshold_per_class_df = load_csv(threshold_per_class_path)
+
+        default_val_metrics = threshold_summary["default_0.5"]["val"]
+        default_test_metrics = threshold_summary["default_0.5"]["test"]
+        tuned_val_metrics = threshold_summary["tuned"]["val"]
+        tuned_test_metrics = threshold_summary["tuned"]["test"]
+
+        default_val_per_class_df = select_threshold_rows(
+            threshold_per_class_df,
+            split="val",
+            threshold_scheme="default_0.5",
+        )
+        default_test_per_class_df = select_threshold_rows(
+            threshold_per_class_df,
+            split="test",
+            threshold_scheme="default_0.5",
+        )
+        tuned_val_per_class_df = select_threshold_rows(
+            threshold_per_class_df,
+            split="val",
+            threshold_scheme="tuned",
+        )
+        tuned_test_per_class_df = select_threshold_rows(
+            threshold_per_class_df,
+            split="test",
+            threshold_scheme="tuned",
+        )
+
+        threshold_output_paths = {
+            "threshold_macro_val": plot_dir / "threshold_macro_comparison_val.png",
+            "threshold_macro_test": plot_dir / "threshold_macro_comparison_test.png",
+            "threshold_delta_val": plot_dir / "threshold_delta_heatmap_val.png",
+            "threshold_delta_test": plot_dir / "threshold_delta_heatmap_test.png",
+        }
+
+        save_threshold_macro_comparison_plot(
+            default_metrics=default_val_metrics,
+            tuned_metrics=tuned_val_metrics,
+            split="val",
+            output_path=threshold_output_paths["threshold_macro_val"],
+        )
+        save_threshold_macro_comparison_plot(
+            default_metrics=default_test_metrics,
+            tuned_metrics=tuned_test_metrics,
+            split="test",
+            output_path=threshold_output_paths["threshold_macro_test"],
+        )
+
+        save_threshold_delta_heatmap(
+            default_df=default_val_per_class_df,
+            tuned_df=tuned_val_per_class_df,
+            split="val",
+            output_path=threshold_output_paths["threshold_delta_val"],
+        )
+        save_threshold_delta_heatmap(
+            default_df=default_test_per_class_df,
+            tuned_df=tuned_test_per_class_df,
+            split="test",
+            output_path=threshold_output_paths["threshold_delta_test"],
+        )
+
+        output_paths.update(threshold_output_paths)
 
     print("Saved plots:")
     for output_path in output_paths.values():

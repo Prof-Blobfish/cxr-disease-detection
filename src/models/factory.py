@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch.nn as nn
-from torchvision.models import DenseNet121_Weights, densenet121
+from torchvision.models import (
+    DenseNet121_Weights, 
+    ConvNeXt_Tiny_Weights,
+    ResNet50_Weights,
+    densenet121,
+    convnext_tiny,
+    resnet50,
+)
 
 
 @dataclass(frozen=True)
@@ -15,7 +22,9 @@ class ModelParts:
     backbone_params: list[nn.Parameter]
     head_params: list[nn.Parameter]
 
+
 BuilderFn = Callable[[dict[str, Any], int], ModelParts]
+
 
 def _build_densenet121(cfg: dict[str, Any], num_classes: int) -> ModelParts:
     pretrained = bool(cfg.get("pretrained", True))
@@ -36,8 +45,58 @@ def _build_densenet121(cfg: dict[str, Any], num_classes: int) -> ModelParts:
     )
 
 
+def _build_resnet50(cfg: dict[str, Any], num_classes: int) -> ModelParts:
+    pretrained = bool(cfg.get("pretrained", True))
+    weights = ResNet50_Weights.DEFAULT if pretrained else None
+
+    model = resnet50(weights=weights)
+
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+
+    head_params = list(model.fc.parameters())
+    head_param_ids = {id(param) for param in head_params}
+    backbone_params = [
+        param
+        for param in model.parameters()
+        if id(param) not in head_param_ids
+    ]
+
+    return ModelParts(
+        model=model,
+        backbone_params=backbone_params,
+        head_params=head_params,
+    )
+
+
+def _build_convnext_tiny(cfg: dict[str, Any], num_classes: int) -> ModelParts:
+    pretrained = bool(cfg.get("pretrained", True))
+    weights = ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+
+    model = convnext_tiny(weights=weights)
+
+    in_features = model.classifier[-1].in_features
+    model.classifier[-1] = nn.Linear(in_features, num_classes)
+
+    head_params = list(model.classifier.parameters())
+    head_param_ids = {id(param) for param in head_params}
+    backbone_params = [
+        param
+        for param in model.parameters()
+        if id(param) not in head_param_ids
+    ]
+
+    return ModelParts(
+        model=model,
+        backbone_params=backbone_params,
+        head_params=head_params,
+    )
+
+
 MODEL_REGISTRY: dict[str, BuilderFn] = {
     "densenet121": _build_densenet121,
+    "resnet50": _build_resnet50,
+    "convnext_tiny": _build_convnext_tiny,
 }
 
 
@@ -65,6 +124,24 @@ def build_parameter_groups(
     optimizer_cfg = cfg["optimizer"]
 
     if model_name == "densenet121":
+        head_params = list(model.classifier.parameters())
+        head_param_ids = {id(param) for param in head_params}
+
+        backbone_params = [
+            param
+            for param in model.parameters()
+            if id(param) not in head_param_ids
+        ]
+    elif model_name == "resnet50":
+        head_params = list(model.fc.parameters())
+        head_param_ids = {id(param) for param in head_params}
+
+        backbone_params = [
+            param
+            for param in model.parameters()
+            if id(param) not in head_param_ids
+        ]
+    elif model_name == "convnext_tiny":
         head_params = list(model.classifier.parameters())
         head_param_ids = {id(param) for param in head_params}
 
